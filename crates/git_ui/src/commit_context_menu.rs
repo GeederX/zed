@@ -87,14 +87,14 @@ pub(crate) fn commit_context_menu(
             .when_some(comparison, |menu, comparison| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
-                menu.entry(
-                    if comparison.commit_count.is_some() {
+                menu.item(
+                    ContextMenuEntry::new(if comparison.commit_count.is_some() {
                         "View Cumulative Changes"
                     } else {
                         "Compare Versions"
-                    },
-                    None,
-                    move |window, cx| {
+                    })
+                    .disabled(!comparison.is_valid)
+                    .handler(move |window, cx| {
                         let Some(repository) = repository.clone() else {
                             return;
                         };
@@ -106,7 +106,7 @@ pub(crate) fn commit_context_menu(
                             window,
                             cx,
                         );
-                    },
+                    }),
                 )
             })
             .when(comparison.is_none(), |menu| {

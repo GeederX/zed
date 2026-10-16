@@ -112,6 +112,10 @@ You can switch between modes at any time. Your preference applies to [Project Di
 
 Open the Git Graph with {#action git_graph::Open} from the Command Palette.
 Selecting one commit shows the changes introduced by that commit.
+Use `Shift`-click to select a continuous range of rows. Use `Cmd`-click on macOS
+or `Ctrl`-click on Linux and Windows to add or remove individual commits,
+including commits separated by other branches' rows. Neither modifier determines
+the comparison mode: the selected commits do.
 When multiple commits are selected, right-clicking a selected commit shows the
 comparison's endpoints and offers the corresponding comparison action.
 Single-commit actions such as **View Diff**, **Copy SHA**, **Copy Tag**, and
@@ -122,13 +126,17 @@ Selection-aware commands can also read the full selection through
 
 ### Cumulative Changes
 
-Click a commit, then hold `Shift` and click another commit to select a range.
-The Changed Files pane shows the cumulative net changes, including the changes
-introduced by the earliest selected commit. This also applies when the range
-contains exactly two commits. Changes that cancel each other out do not appear.
-Selecting a commit and its first parent with `Cmd`-click on macOS or `Ctrl`-click
-on Linux and Windows also shows cumulative changes for both commits, even when
-other branches' commits appear between them in the graph.
+Cumulative changes are shown when three or more commits are selected, or when
+exactly two commits are selected and the older one is the newer one's first
+parent. The Changed Files pane includes the changes introduced by the earliest
+selected commit. Changes that cancel each other out do not appear.
+
+Selections of three or more commits must form connected history: every selected
+commit must be reachable from the newest selected commit by following parent
+links through selected commits only. You can skip unrelated rows from other
+branches, but not intermediate commits on a selected path. Selected paths may
+join at a merge commit. Gaps or unmerged paths produce an error instead of a
+diff, and the comparison action is disabled until the selection is corrected.
 
 Click a changed file to open its cumulative diff, or choose **View Cumulative
 Changes** to open all changed files. The comparison uses the earliest commit's
@@ -138,14 +146,15 @@ must be fetched before it can be included.
 
 ### Compare Versions
 
-Click one commit, then `Cmd`-click another on macOS or `Ctrl`-click another on
-Linux and Windows. Unless one is the other's first parent, the Changed Files
-pane automatically shows the differences between their snapshots.
+When exactly two commits are selected and neither is the other's first parent,
+the Changed Files pane automatically shows the differences between their
+snapshots. This applies whether the two rows were selected with `Shift` or
+`Cmd`/`Ctrl`.
 Click a changed file to open its diff, or choose **Compare Versions** from either
 selected commit's context menu or the details pane to open all changed files.
 
-This compares the two committed snapshots. Unlike a Shift-selected range, it
-does not include the changes introduced by the older commit itself. The commits
+This compares the two committed snapshots. Unlike cumulative changes, it does
+not include the changes introduced by the older commit itself. The commits
 can belong to different branches. Neither comparison changes your working tree
 or commit history.
 

@@ -83,9 +83,18 @@ pub(crate) struct CommitComparison {
     /// `Some(count)` includes the earliest commit by comparing its first parent
     /// (or the empty tree for a root) with the target. `None` compares snapshots.
     pub(crate) commit_count: Option<usize>,
+    pub(crate) is_valid: bool,
 }
 
 impl CommitComparison {
+    pub(crate) fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_valid,
+            "Invalid commit selection: select consecutive commits along the chosen history, without gaps or unmerged commits."
+        );
+        Ok(())
+    }
+
     fn mode_label(self) -> String {
         match self.commit_count {
             Some(1) => "Net changes (1 commit)".to_string(),
@@ -282,6 +291,9 @@ impl CommitView {
     ) {
         let commit_diff = repo.update(cx, |repo, cx| {
             if let Some(comparison) = comparison {
+                if let Err(error) = comparison.validate() {
+                    return Task::ready(Err(error));
+                }
                 repo.load_commit_comparison(
                     comparison.base_commit.to_string(),
                     comparison.target_commit.to_string(),

@@ -8,7 +8,7 @@ use crate::{
     commit_view::{CommitComparison, CommitView},
     git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, BTreeSet, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
@@ -1471,21 +1471,21 @@ struct DetailPanelCommitMessage {
     scroll_handle: ScrollHandle,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum CommitSelection {
     #[default]
     Single,
     Range {
         anchor: usize,
     },
-    Pair {
-        other: usize,
+    Multiple {
+        indices: Rc<BTreeSet<usize>>,
     },
 }
 
 impl CommitSelection {
     fn for_click(
-        self,
+        &self,
         active: Option<usize>,
         clicked: usize,
         extend: bool,
@@ -1493,63 +1493,106 @@ impl CommitSelection {
     ) -> (usize, Self) {
         if extend {
             let anchor = match self {
-                Self::Range { anchor } => anchor,
+                Self::Range { anchor } => *anchor,
                 _ => active.unwrap_or(clicked),
             };
             return (clicked, Self::Range { anchor });
         }
         if toggle {
-            return match (active, self) {
-                (Some(active), Self::Pair { other }) if clicked == active => (other, Self::Single),
-                (Some(active), Self::Pair { other }) if clicked == other => (active, Self::Single),
-                (Some(active), Self::Pair { other }) if clicked != active => {
-                    (clicked, Self::Pair { other })
+            let Some(active) = active else {
+                return (clicked, Self::Single);
+            };
+            if clicked == active && self.endpoints(active).is_none() {
+                return (active, Self::Single);
+            }
+            let mut indices = match self {
+                Self::Single => Rc::new(BTreeSet::from([active])),
+                Self::Range { anchor } => {
+                    Rc::new((active.min(*anchor)..=active.max(*anchor)).collect())
                 }
-                (Some(active), _) if clicked != active => (clicked, Self::Pair { other: active }),
-                _ => (clicked, Self::Single),
+                Self::Multiple { indices } => indices.clone(),
+            };
+            let selected = Rc::make_mut(&mut indices);
+            if !selected.remove(&clicked) {
+                selected.insert(clicked);
+            }
+            let active = if selected.contains(&clicked) {
+                clicked
+            } else if selected.contains(&active) {
+                active
+            } else {
+                selected.first().copied().unwrap_or(active)
+            };
+            return if selected.len() < 2 {
+                (active, Self::Single)
+            } else {
+                (active, Self::Multiple { indices })
             };
         }
         (clicked, Self::Single)
     }
 
-    fn contains(self, active: Option<usize>, index: usize) -> bool {
+    fn contains(&self, active: Option<usize>, index: usize) -> bool {
         let Some(active) = active else {
             return false;
         };
         match self {
             Self::Single => index == active,
-            Self::Range { anchor } => (active.min(anchor)..=active.max(anchor)).contains(&index),
-            Self::Pair { other } => index == active || index == other,
+            Self::Range { anchor } => (active.min(*anchor)..=active.max(*anchor)).contains(&index),
+            Self::Multiple { indices } => indices.contains(&index),
         }
     }
 
-    fn endpoints(self, active: usize) -> Option<(usize, usize)> {
-        let other = match self {
-            Self::Single => return None,
-            Self::Range { anchor } => anchor,
-            Self::Pair { other } => other,
-        };
-        (active != other).then_some((active.min(other), active.max(other)))
+    fn endpoints(&self, active: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::Single => None,
+            Self::Range { anchor } => {
+                (active != *anchor).then_some((active.min(*anchor), active.max(*anchor)))
+            }
+            Self::Multiple { indices } => Some((*indices.first()?, *indices.last()?)),
+        }
     }
 
-    fn comparison(self, active: usize, graph: &GraphData) -> Option<CommitComparison> {
+    fn comparison(&self, active: usize, graph: &GraphData) -> Option<CommitComparison> {
         let (newest, oldest) = self.endpoints(active)?;
         let base = &graph.commits.get(oldest)?.data;
         let target = &graph.commits.get(newest)?.data;
-        let commit_count = match self {
-            Self::Range { .. } => Some(oldest - newest + 1),
-            Self::Pair { .. } if target.parents.first() == Some(&base.sha) => Some(2),
-            _ => None,
+        let count = match self {
+            Self::Single => return None,
+            Self::Range { .. } => oldest - newest + 1,
+            Self::Multiple { indices } => indices.len(),
         };
+        let cumulative = count > 2 || target.parents.first() == Some(&base.sha);
+        let is_valid = count <= 2
+            || match self {
+                Self::Range { .. } => Self::is_connected(newest..=oldest, graph),
+                Self::Multiple { indices } => Self::is_connected(indices.iter().copied(), graph),
+                Self::Single => true,
+            };
         Some(CommitComparison {
             base_commit: base.sha,
             target_commit: target.sha,
-            commit_count,
+            commit_count: cumulative.then_some(count),
+            is_valid,
         })
     }
 
+    fn is_connected(indices: impl Iterator<Item = usize>, graph: &GraphData) -> bool {
+        let mut parents = HashSet::default();
+        for (position, index) in indices.enumerate() {
+            let Some(commit) = graph.commits.get(index) else {
+                return false;
+            };
+            if position > 0 && !parents.remove(&commit.data.sha) {
+                return false;
+            }
+            parents.extend(commit.data.parents.iter().copied());
+        }
+        true
+    }
+
     fn task_selection(
-        self,
+        &self,
         active: Option<usize>,
         target: usize,
         graph: &GraphData,
@@ -1558,22 +1601,25 @@ impl CommitSelection {
         let Some(active) = active.filter(|active| self.contains(Some(*active), target)) else {
             return Some(GitCommandSelection::single(sha));
         };
-        let Some(comparison) = self.comparison(active, graph) else {
-            return Some(GitCommandSelection::single(sha));
-        };
+        let comparison = self.comparison(active, graph);
         let commits = match self {
             Self::Range { anchor } => graph
                 .commits
-                .get(active.min(anchor)..=active.max(anchor))?
+                .get(active.min(*anchor)..=active.max(*anchor))?
                 .iter()
                 .rev()
                 .map(|commit| commit.data.sha)
                 .collect(),
-            _ => smallvec![comparison.base_commit, comparison.target_commit],
+            Self::Multiple { indices } => indices
+                .iter()
+                .rev()
+                .map(|index| graph.commits.get(*index).map(|commit| commit.data.sha))
+                .collect::<Option<_>>()?,
+            Self::Single => smallvec![sha],
         };
         Some(GitCommandSelection {
             commits,
-            comparison: Some(comparison),
+            comparison,
         })
     }
 }
@@ -1592,6 +1638,7 @@ pub struct GitGraph {
     column_visibility: TableRow<bool>,
     selected_entry_idx: Option<usize>,
     commit_selection: CommitSelection,
+    selected_commit_comparison: Option<CommitComparison>,
     hovered_entry_idx: Option<usize>,
     graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     log_source: LogSource,
@@ -1869,6 +1916,7 @@ impl GitGraph {
             column_visibility,
             selected_entry_idx: None,
             commit_selection: CommitSelection::Single,
+            selected_commit_comparison: None,
             hovered_entry_idx: None,
             graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
@@ -2301,6 +2349,7 @@ impl GitGraph {
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
         self.commit_selection = CommitSelection::Single;
+        self.selected_commit_comparison = None;
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.selected_commit_diff_error = None;
@@ -2504,8 +2553,7 @@ impl GitGraph {
     }
 
     fn selected_comparison(&self) -> Option<CommitComparison> {
-        self.commit_selection
-            .comparison(self.selected_entry_idx?, &self.graph_data)
+        self.selected_commit_comparison
     }
 
     fn select_entry_with_selection(
@@ -2528,6 +2576,7 @@ impl GitGraph {
 
         self.selected_entry_idx = Some(idx);
         self.commit_selection = selection;
+        self.selected_commit_comparison = self.commit_selection.comparison(idx, &self.graph_data);
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.selected_commit_diff_error = None;
@@ -2559,14 +2608,18 @@ impl GitGraph {
         }
 
         let diff_task = if let Some(comparison) = comparison {
-            repository.update(cx, |repo, cx| {
-                repo.load_commit_comparison(
-                    comparison.base_commit.to_string(),
-                    comparison.target_commit.to_string(),
-                    comparison.commit_count.is_some(),
-                    cx,
-                )
-            })
+            if let Err(error) = comparison.validate() {
+                Task::ready(Err(error))
+            } else {
+                repository.update(cx, |repo, cx| {
+                    repo.load_commit_comparison(
+                        comparison.base_commit.to_string(),
+                        comparison.target_commit.to_string(),
+                        comparison.commit_count.is_some(),
+                        cx,
+                    )
+                })
+            }
         } else {
             repository.update(cx, |repo, cx| repo.load_commit_diff(diff_handle, false, cx))
         };
@@ -3828,6 +3881,7 @@ impl GitGraph {
                         },
                     )
                     .full_width()
+                    .disabled(comparison.is_some_and(|comparison| !comparison.is_valid))
                     .start_icon(
                         Icon::new(IconName::GitCommit)
                             .size(IconSize::Small)
@@ -3888,7 +3942,7 @@ impl GitGraph {
 
         let hovered_entry_idx = self.hovered_entry_idx;
         let selected_entry_idx = self.selected_entry_idx;
-        let commit_selection = self.commit_selection;
+        let commit_selection = self.commit_selection.clone();
         let context_menu_target_index = self
             .context_menu
             .as_ref()
@@ -4203,7 +4257,7 @@ impl GitGraph {
         // the row.
         let hovered_entry_idx = self.hovered_entry_idx;
         let selected_entry_idx = self.selected_entry_idx;
-        let commit_selection = self.commit_selection;
+        let commit_selection = &self.commit_selection;
         let context_menu_entry_idx = self
             .context_menu
             .as_ref()
@@ -4765,7 +4819,7 @@ impl Render for GitGraph {
                         .child({
                             let row_height = Self::row_height(window, cx);
                             let selected_entry_idx = self.selected_entry_idx;
-                            let commit_selection = self.commit_selection;
+                            let commit_selection = self.commit_selection.clone();
                             let hovered_entry_idx = self.hovered_entry_idx;
                             let context_menu_target_index = self
                                 .context_menu
@@ -6127,6 +6181,12 @@ mod tests {
         Ok(())
     }
 
+    fn multiple_selection(indices: impl IntoIterator<Item = usize>) -> CommitSelection {
+        CommitSelection::Multiple {
+            indices: Rc::new(indices.into_iter().collect()),
+        }
+    }
+
     #[test]
     fn test_commit_selection_shift_preserves_anchor_and_includes_both_ends() {
         let (active, selection) = CommitSelection::Single.for_click(Some(4), 3, true, false);
@@ -6149,23 +6209,42 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_selection_toggle_keeps_only_two_endpoints() {
+    fn test_commit_selection_toggle_preserves_and_removes_multiple_commits() {
         let (active, selection) = CommitSelection::Single.for_click(Some(2), 6, false, true);
-        assert_eq!(selection, CommitSelection::Pair { other: 2 });
-        assert_eq!(selection.endpoints(active), Some((2, 6)));
+        let previous = selection.clone();
+        let (active, selection) = selection.for_click(Some(active), 8, false, true);
+        assert_eq!(selection, multiple_selection([2, 6, 8]));
+        assert!(!previous.contains(Some(6), 8));
+        assert_eq!(selection.endpoints(active), Some((2, 8)));
         assert!(!selection.contains(Some(active), 4));
 
+        let (active, selection) = selection.for_click(Some(active), 4, false, true);
+        assert_eq!(selection, multiple_selection([2, 4, 6, 8]));
+        let (active, selection) = selection.for_click(Some(active), 6, false, true);
+        assert_eq!(selection, multiple_selection([2, 4, 8]));
+        assert_eq!(active, 4);
+        let (active, selection) = selection.for_click(Some(active), 4, false, true);
+        assert_eq!(selection, multiple_selection([2, 8]));
+        assert!(selection.contains(Some(active), active));
+        let (active, selection) = selection.for_click(Some(active), 8, false, true);
+        assert_eq!((active, &selection), (2, &CommitSelection::Single));
         assert_eq!(
             selection.for_click(Some(active), 2, false, true),
-            (6, CommitSelection::Single),
-        );
-        assert_eq!(
-            selection.for_click(Some(active), 6, false, true),
             (2, CommitSelection::Single),
         );
+    }
+
+    #[test]
+    fn test_commit_selection_toggle_edits_a_range_and_shift_starts_a_new_range() {
+        let (active, selection) = CommitSelection::Single.for_click(Some(2), 6, true, false);
+        let (active, selection) = selection.for_click(Some(active), 4, false, true);
+        assert_eq!(selection, multiple_selection([2, 3, 5, 6]));
         let (active, selection) = selection.for_click(Some(active), 8, false, true);
-        assert_eq!(selection.endpoints(active), Some((2, 8)));
-        assert!(!selection.contains(Some(active), 6));
+        assert_eq!(selection, multiple_selection([2, 3, 5, 6, 8]));
+        let (active, selection) = selection.for_click(Some(active), 4, true, true);
+        assert_eq!(selection, CommitSelection::Range { anchor: 8 });
+        assert_eq!(selection.endpoints(active), Some((4, 8)));
+        assert!(!selection.contains(Some(active), 3));
     }
 
     #[test]
@@ -6210,17 +6289,19 @@ mod tests {
             None,
         );
         for (selection, active, base_commit, commit_count) in [
-            (CommitSelection::Pair { other: 0 }, 1, second_parent, None),
-            (CommitSelection::Pair { other: 1 }, 0, second_parent, None),
-            (CommitSelection::Pair { other: 0 }, 2, first_parent, Some(2)),
-            (CommitSelection::Pair { other: 2 }, 0, first_parent, Some(2)),
-            (CommitSelection::Pair { other: 0 }, 3, root, None),
+            (multiple_selection([0, 1]), 1, second_parent, None),
+            (multiple_selection([0, 1]), 0, second_parent, None),
+            (multiple_selection([0, 2]), 2, first_parent, Some(2)),
+            (multiple_selection([0, 2]), 0, first_parent, Some(2)),
+            (multiple_selection([0, 3]), 3, root, None),
+            (multiple_selection([0, 1, 2]), 0, first_parent, Some(3)),
             (
                 CommitSelection::Range { anchor: 0 },
-                1,
-                second_parent,
-                Some(2),
+                2,
+                first_parent,
+                Some(3),
             ),
+            (CommitSelection::Range { anchor: 0 }, 1, second_parent, None),
             (CommitSelection::Range { anchor: 0 }, 3, root, Some(4)),
             (CommitSelection::Range { anchor: 3 }, 0, root, Some(4)),
         ] {
@@ -6230,10 +6311,67 @@ mod tests {
                     base_commit,
                     target_commit: merge,
                     commit_count,
+                    is_valid: true,
                 }),
                 "{selection:?}, active {active}",
             );
         }
+    }
+
+    #[test]
+    fn test_cumulative_selection_requires_connected_history() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let [
+            merge,
+            feature_tip,
+            main_tip,
+            main_previous,
+            feature_previous,
+            unmerged,
+            root,
+        ] = std::array::from_fn(|_| Oid::random(&mut rng));
+        let commits = [
+            (merge, smallvec![main_tip, feature_tip]),
+            (feature_tip, smallvec![feature_previous]),
+            (main_tip, smallvec![main_previous]),
+            (main_previous, smallvec![root]),
+            (feature_previous, smallvec![root]),
+            (unmerged, smallvec![root]),
+            (root, smallvec![]),
+        ]
+        .map(|(sha, parents)| {
+            Arc::new(InitialGraphCommitData {
+                sha,
+                parents,
+                ref_names: Vec::new(),
+            })
+        });
+        let mut graph = GraphData::new(8);
+        graph.add_commits(&commits);
+        for (indices, valid) in [
+            (vec![0, 2, 3], true),
+            (vec![0, 2, 6], false),
+            (vec![0, 1, 2], true),
+            (vec![0, 1, 4], true),
+            (vec![0, 2, 4], false),
+            (vec![0, 2, 3, 6], true),
+            (vec![0, 2, 3, 5, 6], false),
+        ] {
+            let comparison = multiple_selection(indices.iter().copied())
+                .comparison(0, &graph)
+                .expect("multiple commits should have comparison endpoints");
+            assert_eq!(comparison.commit_count, Some(indices.len()));
+            assert_eq!(comparison.validate().is_ok(), valid, "{indices:?}");
+        }
+        let comparison = CommitSelection::Range { anchor: 0 }
+            .comparison(6, &graph)
+            .expect("range should have comparison endpoints");
+        assert!(comparison.validate().is_err());
+        let comparison = multiple_selection([2, 5])
+            .comparison(2, &graph)
+            .expect("unmerged snapshots can still be compared");
+        assert_eq!(comparison.commit_count, None);
+        assert!(comparison.validate().is_ok());
     }
 
     #[gpui::test]
@@ -6297,18 +6435,46 @@ mod tests {
                 "cumulative",
             ),
             (
-                CommitSelection::Pair { other: 0 },
+                multiple_selection([0, 2]),
                 Some(2),
                 0,
                 vec![first_parent, merge],
                 "cumulative",
             ),
             (
-                CommitSelection::Pair { other: 0 },
+                multiple_selection([0, 1]),
                 Some(1),
                 1,
                 vec![second_parent, merge],
                 "snapshots",
+            ),
+            (
+                multiple_selection([0, 1, 2]),
+                Some(0),
+                1,
+                vec![first_parent, second_parent, merge],
+                "cumulative",
+            ),
+            (
+                multiple_selection([0, 2, 3]),
+                Some(0),
+                2,
+                vec![root, first_parent, merge],
+                "cumulative",
+            ),
+            (
+                CommitSelection::Range { anchor: 0 },
+                Some(1),
+                1,
+                vec![second_parent, merge],
+                "snapshots",
+            ),
+            (
+                multiple_selection([0, 2, 3]),
+                Some(0),
+                1,
+                vec![second_parent],
+                "single",
             ),
             (
                 CommitSelection::Range { anchor: 0 },

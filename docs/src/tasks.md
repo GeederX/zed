@@ -319,8 +319,9 @@ For example, a cumulative selection of two commits produces this shape:
   top in the graph, independent of click order. It is not a `git rev-list`
   expansion: a two-commit selection contains only those two commits.
 - `commit_count` is the number of entries in `commits`.
-- `mode` is `single` for one commit, `cumulative` for a Shift-selected range or
-  a commit and its first parent, and `snapshots` for other two-commit selections.
+- `mode` is `single` for one commit, `cumulative` for three or more commits or
+  two commits connected by a first-parent link, and `snapshots` for other
+  two-commit selections. The selection gesture does not determine this mode.
 - `base_commit` and `target_commit` are the first and last SHAs in `commits`.
   For a single commit, both are that commit.
 - `include_base_commit` is `true` for `single` and `cumulative`, and `false` for
@@ -335,9 +336,10 @@ context for the clicked commit. Ref menus, including refs hidden behind a
 The legacy SHA variables always identify the clicked commit, even when it is
 in the middle of a range.
 
-The JSON describes the selection; it does not validate ancestry or run Git
-operations. A script using cumulative semantics must handle unrelated history,
-root commits, and missing shallow history appropriately.
+The JSON describes the selected rows, not a validated sequence of patches, and
+does not run Git operations. A script using cumulative semantics must follow
+the [connected-history rules](./git.md#cumulative-changes) and handle root commits
+and missing shallow history appropriately.
 
 For a POSIX shell with Python 3 installed, this task prints the selection:
 
