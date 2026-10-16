@@ -108,6 +108,47 @@ See [Configuring Zed](./configuring-zed.md) for more about the Settings Editor.
 
 You can switch between modes at any time. Your preference applies to [Project Diff](#project-diff), [File History](#file-history), and [Stash Diff View](#stash-diff-view). These diff views function as [multibuffers](./multibuffers.md), allowing you to edit multiple excerpts simultaneously.
 
+## Git Graph
+
+Open the Git Graph with {#action git_graph::Open} from the Command Palette.
+Selecting one commit shows the changes introduced by that commit.
+When multiple commits are selected, right-clicking a selected commit shows the
+comparison's endpoints and offers the corresponding comparison action.
+Single-commit actions such as **View Diff**, **Copy SHA**, **Copy Tag**, and
+**Create Tag…** are hidden. Custom Commands retain the right-clicked commit's
+SHA/ref variables; its short SHA is shown in the Custom Commands heading.
+Selection-aware commands can also read the full selection through
+[`ZED_GIT_SELECTION`](./tasks.md#selection-aware-commands).
+
+### Cumulative Changes
+
+Click a commit, then hold `Shift` and click another commit to select a range.
+The Changed Files pane shows the cumulative net changes, including the changes
+introduced by the earliest selected commit. This also applies when the range
+contains exactly two commits. Changes that cancel each other out do not appear.
+Selecting a commit and its first parent with `Cmd`-click on macOS or `Ctrl`-click
+on Linux and Windows also shows cumulative changes for both commits, even when
+other branches' commits appear between them in the graph.
+
+Click a changed file to open its cumulative diff, or choose **View Cumulative
+Changes** to open all changed files. The comparison uses the earliest commit's
+first parent as its baseline, or the empty tree if that commit is a root.
+The earliest commit must be an ancestor of the latest; missing shallow history
+must be fetched before it can be included.
+
+### Compare Versions
+
+Click one commit, then `Cmd`-click another on macOS or `Ctrl`-click another on
+Linux and Windows. Unless one is the other's first parent, the Changed Files
+pane automatically shows the differences between their snapshots.
+Click a changed file to open its diff, or choose **Compare Versions** from either
+selected commit's context menu or the details pane to open all changed files.
+
+This compares the two committed snapshots. Unlike a Shift-selected range, it
+does not include the changes introduced by the older commit itself. The commits
+can belong to different branches. Neither comparison changes your working tree
+or commit history.
+
 ## File History
 
 File History shows the commit history for an individual file. Each entry displays the commit's author, timestamp, and message. Selecting a commit opens a diff view filtered to show only the changes made to that file in that commit.

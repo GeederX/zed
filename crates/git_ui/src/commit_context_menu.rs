@@ -1,7 +1,12 @@
-use crate::{commit_view::CommitView, create_tag_at_commit};
+use crate::{
+    commit_view::{CommitComparison, CommitView},
+    create_tag_at_commit,
+};
 use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
+use serde::Serialize;
+use smallvec::{SmallVec, smallvec};
 
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
@@ -28,6 +33,20 @@ pub(crate) struct CommitContextMenuData {
     pub(crate) tag_names: Vec<SharedString>,
 }
 
+pub(crate) struct GitCommandSelection {
+    pub(crate) commits: SmallVec<[Oid; 2]>,
+    pub(crate) comparison: Option<CommitComparison>,
+}
+
+impl GitCommandSelection {
+    pub(crate) fn single(commit: Oid) -> Self {
+        Self {
+            commits: smallvec![commit],
+            comparison: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitContextMenuSource {
     GitGraph,
@@ -41,121 +60,160 @@ pub(crate) fn commit_context_menu(
     focus_handle: FocusHandle,
     repository: Option<WeakEntity<Repository>>,
     workspace: WeakEntity<Workspace>,
+    selection: GitCommandSelection,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
     let sha_short = sha.display_short();
+    let comparison = selection.comparison;
     let git_tasks = git_context_menu_tasks(
-        git_task_context(&repository, sha, ref_name.as_deref(), cx),
+        git_task_context(&repository, sha, ref_name.as_deref(), &selection, cx),
         &workspace,
         cx,
     );
-    let header = match &ref_name {
-        Some(ref_name) => format!("Ref {ref_name}"),
-        None => format!("Commit {sha_short}"),
+    let header = match comparison {
+        Some(comparison) => comparison.title(),
+        None => match &ref_name {
+            Some(ref_name) => format!("Ref {ref_name}"),
+            None => format!("Commit {sha_short}"),
+        },
     };
 
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
             .context(focus_handle)
             .header(header)
-            .entry("View Diff", Some(OpenCommitView.boxed_clone()), {
+            .when_some(comparison, |menu, comparison| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
-                move |window, cx| {
-                    let Some(repository) = repository.clone() else {
-                        return;
-                    };
-                    CommitView::open(
-                        sha.to_string(),
-                        repository,
-                        workspace.clone(),
-                        None,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
+                menu.entry(
+                    if comparison.commit_count.is_some() {
+                        "View Cumulative Changes"
+                    } else {
+                        "Compare Versions"
+                    },
+                    None,
+                    move |window, cx| {
+                        let Some(repository) = repository.clone() else {
+                            return;
+                        };
+                        CommitView::open_comparison(
+                            comparison,
+                            None,
+                            repository,
+                            workspace.clone(),
+                            window,
+                            cx,
+                        );
+                    },
+                )
             })
-            .entry(
-                "Copy SHA",
-                Some(CopyCommitSha.boxed_clone()),
-                move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
-                },
-            )
-            .when_some(ref_name.clone(), |menu, ref_name| {
-                menu.entry("Copy Ref Name", None, move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
-                })
-            })
-            .when(ref_name.is_none(), |menu| {
-                menu.map(|menu| {
-                    let tag_names = commit.tag_names.clone();
-                    let copy_tag_label = "Copy Tag";
-
-                    match tag_names.as_slice() {
-                        [] => menu.item(
-                            ContextMenuEntry::new(copy_tag_label)
-                                .action(CopyCommitTag.boxed_clone())
-                                .disabled(true),
-                        ),
-                        [tag_name] => {
-                            let tag_name = tag_name.clone();
-                            let label = format!("{copy_tag_label}: {tag_name}");
-                            menu.entry(
-                                label,
-                                Some(CopyCommitTag.boxed_clone()),
-                                move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        tag_name.to_string(),
-                                    ));
-                                },
-                            )
-                        }
-                        _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
-                            let mut menu = menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
-
-                            for tag_name in tag_names.clone() {
-                                let tag_name_to_copy = tag_name.clone();
-                                menu = menu.entry(tag_name, None, move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        tag_name_to_copy.to_string(),
-                                    ));
-                                });
-                            }
-                            menu
-                        }),
+            .when(comparison.is_none(), |menu| {
+                menu.entry("View Diff", Some(OpenCommitView.boxed_clone()), {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let Some(repository) = repository.clone() else {
+                            return;
+                        };
+                        CommitView::open(
+                            sha.to_string(),
+                            repository,
+                            workspace.clone(),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        );
                     }
                 })
-            })
-            .entry("Create Tag…", None, {
-                let repository = repository.clone();
-                let workspace = workspace.clone();
-                move |window, cx| {
-                    let Some(repository) = repository.as_ref().and_then(WeakEntity::upgrade) else {
-                        return;
-                    };
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            create_tag_at_commit(sha, false, repository, workspace, window, cx);
-                        })
-                        .log_err();
-                }
-            })
-            .when(source == CommitContextMenuSource::GitPanel, |menu| {
-                menu.entry("Show in Git Graph", None, move |window, cx| {
-                    window.dispatch_action(
-                        Box::new(crate::git_graph::OpenAtCommit {
-                            sha: sha.to_string(),
-                        }),
-                        cx,
-                    );
+                .entry(
+                    "Copy SHA",
+                    Some(CopyCommitSha.boxed_clone()),
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                    },
+                )
+                .when_some(ref_name.clone(), |menu, ref_name| {
+                    menu.entry("Copy Ref Name", None, move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
+                    })
+                })
+                .when(ref_name.is_none(), |menu| {
+                    menu.map(|menu| {
+                        let tag_names = commit.tag_names.clone();
+                        let copy_tag_label = "Copy Tag";
+
+                        match tag_names.as_slice() {
+                            [] => menu.item(
+                                ContextMenuEntry::new(copy_tag_label)
+                                    .action(CopyCommitTag.boxed_clone())
+                                    .disabled(true),
+                            ),
+                            [tag_name] => {
+                                let tag_name = tag_name.clone();
+                                let label = format!("{copy_tag_label}: {tag_name}");
+                                menu.entry(
+                                    label,
+                                    Some(CopyCommitTag.boxed_clone()),
+                                    move |_window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            tag_name.to_string(),
+                                        ));
+                                    },
+                                )
+                            }
+                            _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
+                                let mut menu =
+                                    menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
+
+                                for tag_name in tag_names.clone() {
+                                    let tag_name_to_copy = tag_name.clone();
+                                    menu = menu.entry(tag_name, None, move |_window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            tag_name_to_copy.to_string(),
+                                        ));
+                                    });
+                                }
+                                menu
+                            }),
+                        }
+                    })
+                })
+                .entry("Create Tag…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let Some(repository) = repository.as_ref().and_then(WeakEntity::upgrade)
+                        else {
+                            return;
+                        };
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                create_tag_at_commit(sha, false, repository, workspace, window, cx);
+                            })
+                            .log_err();
+                    }
+                })
+                .when(source == CommitContextMenuSource::GitPanel, |menu| {
+                    menu.entry("Show in Git Graph", None, move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(crate::git_graph::OpenAtCommit {
+                                sha: sha.to_string(),
+                            }),
+                            cx,
+                        );
+                    })
                 })
             })
             .map(|mut menu| {
-                menu = menu.separator().header("Custom Commands");
+                let header = if comparison.is_some() {
+                    format!("Custom Commands · {sha_short}")
+                } else {
+                    "Custom Commands".to_string()
+                };
+                menu = menu.separator().header(header);
 
                 if git_tasks.is_empty() {
                     return menu.item(
@@ -198,6 +256,7 @@ pub(crate) fn git_task_context(
     repository: &Option<WeakEntity<Repository>>,
     commit_sha: git::Oid,
     ref_name: Option<&str>,
+    selection: &GitCommandSelection,
     cx: &App,
 ) -> Option<TaskContext> {
     let repository_path = repository
@@ -210,9 +269,41 @@ pub(crate) fn git_task_context(
         .file_name()
         .and_then(|name| name.to_str())
         .map(ToString::to_string);
+    #[derive(Serialize)]
+    struct Selection<'a> {
+        commits: &'a [Oid],
+        commit_count: usize,
+        mode: &'static str,
+        base_commit: Oid,
+        target_commit: Oid,
+        include_base_commit: bool,
+    }
+    let (mode, base_commit, target_commit, include_base_commit) = match selection.comparison {
+        Some(comparison) => (
+            if comparison.commit_count.is_some() {
+                "cumulative"
+            } else {
+                "snapshots"
+            },
+            comparison.base_commit,
+            comparison.target_commit,
+            comparison.commit_count.is_some(),
+        ),
+        None => ("single", commit_sha, commit_sha, true),
+    };
+    let selection = serde_json::to_string(&Selection {
+        commits: &selection.commits,
+        commit_count: selection.commits.len(),
+        mode,
+        base_commit,
+        target_commit,
+        include_base_commit,
+    })
+    .log_err()?;
     let mut task_variables = TaskVariables::from_iter([
         (VariableName::GitSha, commit_sha.to_string()),
         (VariableName::GitShaShort, commit_sha.display_short()),
+        (VariableName::GitSelection, selection),
         (
             VariableName::GitRepositoryPath,
             repository_path.to_string_lossy().into_owned(),

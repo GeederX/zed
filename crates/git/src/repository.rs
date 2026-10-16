@@ -623,6 +623,67 @@ async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
     }
 }
 
+async fn load_commit_diff_files(git: &GitBinary, raw_diff: &[u8]) -> Result<CommitDiff> {
+    let raw_diff = String::from_utf8_lossy(raw_diff);
+    let changes = parse_git_diff_raw(&raw_diff);
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+    let stdin = cat_file_process
+        .stdin
+        .take()
+        .context("git cat-file process has no stdin")?;
+    let stdout = cat_file_process
+        .stdout
+        .take()
+        .context("git cat-file process has no stdout")?;
+    let mut stdin = BufWriter::with_capacity(512, stdin);
+    let mut stdout = BufReader::new(stdout);
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    let mut files = Vec::new();
+    for change in changes {
+        let change = change?;
+        // Git's raw diff outputs `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::from_unix_str(change.path).log_err() else {
+            continue;
+        };
+        let objects = [change.new_object, change.old_object];
+        let mut has_blobs = false;
+        for object in objects.iter().flatten() {
+            if object.kind == CommitDiffObjectKind::Blob {
+                stdin.write_all(object.oid.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                has_blobs = true;
+            }
+        }
+        if has_blobs {
+            stdin.flush().await?;
+        }
+        let [new_object, old_object] = objects;
+        let new_object =
+            load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let old_object =
+            load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
+            || old_object.as_ref().is_some_and(|object| object.is_binary);
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_content: old_object.map(|object| object.content),
+            new_content: new_object.map(|object| object.content),
+            is_binary,
+        });
+    }
+    Ok(CommitDiff {
+        files,
+        is_shallow_boundary: false,
+    })
+}
+
 async fn read_shallow_file(shallow_file_path: &Path) -> Result<Option<String>> {
     match smol::fs::read_to_string(shallow_file_path).await {
         Ok(contents) => Ok(Some(contents)),
@@ -922,6 +983,15 @@ pub trait GitRepository: Send + Sync {
         &self,
         commit: String,
         ignore_shallow_boundary: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Compares snapshots, optionally including the changes introduced by the base commit.
+    fn load_commit_comparison(
+        &self,
+        base_commit: String,
+        target_commit: String,
+        include_base_commit: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
     fn blame(
@@ -1497,75 +1567,91 @@ impl GitRepository for RealGitRepository {
                 String::from_utf8_lossy(&show_output.stderr)
             );
 
-            let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-            let changes = parse_git_diff_raw(&show_stdout);
+            load_commit_diff_files(&git, &show_output.stdout).await
+        })
+        .boxed()
+    }
 
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
-
-            let mut files = Vec::<CommitFile>::new();
-            let stdin = cat_file_process
-                .stdin
-                .take()
-                .context("git cat-file process has no stdin")?;
-            let stdout = cat_file_process
-                .stdout
-                .take()
-                .context("git cat-file process has no stdout")?;
-            let mut stdin = BufWriter::with_capacity(512, stdin);
-            let mut stdout = BufReader::new(stdout);
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for change in changes {
-                let change = change?;
-                let path = change.path;
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
-                    continue;
-                };
-
-                let objects = [change.new_object, change.old_object];
-                let mut has_blobs = false;
-                for object in objects.iter().flatten() {
-                    if object.kind == CommitDiffObjectKind::Blob {
-                        stdin.write_all(object.oid.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        has_blobs = true;
-                    }
+    fn load_commit_comparison(
+        &self,
+        base_commit: String,
+        target_commit: String,
+        include_base_commit: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let base = git
+                .run(&["rev-parse", "--verify", "--end-of-options", &format!("{base_commit}^{{commit}}")])
+                .await
+                .with_context(|| format!("resolving comparison base commit {base_commit:?}"))?;
+            let target = git
+                .run(&["rev-parse", "--verify", "--end-of-options", &format!("{target_commit}^{{commit}}")])
+                .await
+                .with_context(|| format!("resolving comparison target commit {target_commit:?}"))?;
+            let baseline = if include_base_commit {
+                let ancestry = git
+                    .build_command(&["merge-base", "--is-ancestor", &base, &target])
+                    .output()
+                    .await
+                    .context("checking inclusive comparison ancestry")?;
+                anyhow::ensure!(
+                    ancestry.status.success(),
+                    "Cannot show cumulative changes: base commit {base_commit:?} must be an ancestor of target commit {target_commit:?}. Select commits on the same history, or fetch missing shallow history. {}",
+                    String::from_utf8_lossy(&ancestry.stderr)
+                );
+                // Read the actual commit object: rev-list and `^` revision traversal treat
+                // shallow boundaries as roots even when the object names a missing parent.
+                let commit_object = git
+                    .build_command(&["cat-file", "commit", &base])
+                    .output()
+                    .await
+                    .context("reading comparison base commit headers")?;
+                anyhow::ensure!(
+                    commit_object.status.success(),
+                    "git cat-file failed: {}",
+                    String::from_utf8_lossy(&commit_object.stderr)
+                );
+                if let Some(parent) = commit_object
+                    .stdout
+                    .split(|byte| *byte == b'\n')
+                    .take_while(|line| !line.is_empty())
+                    .find_map(|line| line.strip_prefix(b"parent "))
+                {
+                    let parent = std::str::from_utf8(parent)?;
+                    git.run(&["rev-parse", "--verify", &format!("{parent}^{{commit}}")])
+                        .await
+                        .with_context(|| format!("loading first parent of comparison base {base_commit:?}; history may be shallow"))?
+                } else {
+                    let output = git.build_command(&["hash-object", "-t", "tree", "--stdin"])
+                        .stdin(Stdio::null())
+                        .output()
+                        .await
+                        .context("calculating empty tree for root commit comparison")?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "git hash-object failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    String::from_utf8(output.stdout)?.trim_end().to_owned()
                 }
-                if has_blobs {
-                    stdin.flush().await?;
-                }
-
-                let [new_object, old_object] = objects;
-                let new_object =
-                    load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let old_object =
-                    load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
-                    || old_object.as_ref().is_some_and(|object| object.is_binary);
-                let new_content = new_object.map(|object| object.content);
-                let old_content = old_object.map(|object| object.content);
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_content,
-                    new_content,
-                    is_binary,
-                })
-            }
-
-            Ok(CommitDiff {
-                files,
-                is_shallow_boundary: false,
-            })
+            } else {
+                base
+            };
+            let output = git
+                .build_command(&[
+                    "diff", "--raw", "-z", "--no-renames", "--no-abbrev",
+                    &baseline, &target, "--",
+                ])
+                .output()
+                .await
+                .context("loading commit comparison")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git diff failed for commit comparison: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            load_commit_diff_files(&git, &output.stdout).await
         })
         .boxed()
     }
@@ -4697,6 +4783,315 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_load_commit_comparison_inclusive_and_snapshots(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("a.txt"), "original\n").unwrap();
+        fs::write(path.join("deleted.txt"), "deleted\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "initial"]);
+        fs::write(path.join("a.txt"), "intermediate\n").unwrap();
+        fs::write(path.join("earliest.txt"), "earliest\n").unwrap();
+        fs::remove_file(path.join("deleted.txt")).unwrap();
+        git_command(path, ["add", "-A"]);
+        git_command(path, ["commit", "-m", "earliest"]);
+        fs::write(path.join("a.txt"), "original\n").unwrap();
+        fs::write(path.join("latest.txt"), "latest\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "latest"]);
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        let cumulative = repository
+            .load_commit_comparison("HEAD~1".into(), "HEAD".into(), true, cx.to_async())
+            .await
+            .unwrap();
+        assert!(!cumulative.is_shallow_boundary);
+        assert_eq!(
+            cumulative
+                .files
+                .iter()
+                .map(|file| (
+                    file.path.as_unix_str(),
+                    file.status(),
+                    file.old_content.as_deref(),
+                    file.new_content.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "deleted.txt",
+                    CommitFileStatus::Deleted,
+                    Some(b"deleted\n".as_slice()),
+                    None
+                ),
+                (
+                    "earliest.txt",
+                    CommitFileStatus::Added,
+                    None,
+                    Some(b"earliest\n".as_slice())
+                ),
+                (
+                    "latest.txt",
+                    CommitFileStatus::Added,
+                    None,
+                    Some(b"latest\n".as_slice())
+                ),
+            ],
+        );
+        // The earliest modification of a.txt cancels out across the whole range.
+        let snapshot = repository
+            .load_commit_comparison("HEAD~1".into(), "HEAD".into(), false, cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.files[0].path.as_unix_str(), "a.txt");
+        assert_eq!(
+            snapshot.files[0].old_content.as_deref(),
+            Some(b"intermediate\n".as_slice())
+        );
+        assert_eq!(
+            snapshot.files[0].new_content.as_deref(),
+            Some(b"original\n".as_slice())
+        );
+        assert_eq!(snapshot.files[0].status(), CommitFileStatus::Modified);
+        assert_eq!(snapshot.files[1].status(), CommitFileStatus::Added);
+        let reversed = repository
+            .load_commit_comparison("HEAD".into(), "HEAD~1".into(), false, cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(reversed.files.len(), 2);
+        assert_eq!(reversed.files[0].old_content, snapshot.files[0].new_content);
+        assert_eq!(reversed.files[0].new_content, snapshot.files[0].old_content);
+        assert_eq!(reversed.files[1].status(), CommitFileStatus::Deleted);
+        let error = repository
+            .load_commit_comparison("HEAD".into(), "HEAD~1".into(), true, cx.to_async())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ancestor"), "{error:#}");
+        for include_base in [false, true] {
+            let same = repository
+                .load_commit_comparison("HEAD".into(), "HEAD".into(), include_base, cx.to_async())
+                .await
+                .unwrap();
+            assert_eq!(same.files.len(), if include_base { 2 } else { 0 });
+            for (base, target, context) in [
+                ("missing-commit", "HEAD", "base"),
+                ("HEAD", "missing-commit", "target"),
+                ("--all", "HEAD", "base"),
+                ("HEAD:a.txt", "HEAD", "base"),
+            ] {
+                let error = repository
+                    .load_commit_comparison(base.into(), target.into(), include_base, cx.to_async())
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(context), "{error:#}");
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_comparison_with_non_utf8_message(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().expect("create comparison repository");
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("file.txt"), "before\n").expect("write initial file");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "root"]);
+        fs::write(path.join("file.txt"), "after\n").expect("update file");
+        fs::write(path.join(".git/message"), b"caf\xe9\n").expect("write encoded commit message");
+        git_command(path, ["add", "."]);
+        git_command(
+            path,
+            [
+                "-c",
+                "i18n.commitEncoding=ISO-8859-1",
+                "commit",
+                "--quiet",
+                "-F",
+                ".git/message",
+            ],
+        );
+        fs::write(path.join("later.txt"), "later\n").expect("write later file");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "target"]);
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("open comparison repository");
+        let comparison = repository
+            .load_commit_comparison("HEAD~1".into(), "HEAD".into(), true, cx.to_async())
+            .await
+            .expect("compare commits with a non-UTF-8 base message");
+        let file = comparison
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "file.txt")
+            .expect("earliest commit change is included");
+        assert_eq!(file.old_content.as_deref(), Some(b"before\n".as_slice()));
+        assert_eq!(file.new_content.as_deref(), Some(b"after\n".as_slice()));
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_comparison_root_object_formats(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        for format in ["sha1", "sha256"] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let path = repo_dir.path();
+            git_command(
+                path,
+                ["init", "-b", "main", &format!("--object-format={format}")],
+            );
+            fs::write(path.join("root.txt"), "root\n").unwrap();
+            git_command(path, ["add", "."]);
+            git_command(path, ["commit", "-m", "root"]);
+            fs::write(path.join("later.txt"), "later\n").unwrap();
+            git_command(path, ["add", "."]);
+            git_command(path, ["commit", "-m", "later"]);
+            let repository =
+                RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                    .unwrap();
+            let inclusive = repository
+                .load_commit_comparison("HEAD~1".into(), "HEAD".into(), true, cx.to_async())
+                .await
+                .unwrap();
+            assert_eq!(inclusive.files.len(), 2);
+            assert!(
+                inclusive
+                    .files
+                    .iter()
+                    .all(|file| file.status() == CommitFileStatus::Added)
+            );
+            assert_eq!(
+                inclusive.files[0].new_content.as_deref(),
+                Some(b"later\n".as_slice())
+            );
+            assert_eq!(
+                inclusive.files[1].new_content.as_deref(),
+                Some(b"root\n".as_slice())
+            );
+            let snapshot = repository
+                .load_commit_comparison("HEAD~1".into(), "HEAD".into(), false, cx.to_async())
+                .await
+                .unwrap();
+            assert_eq!(snapshot.files.len(), 1);
+            assert_eq!(snapshot.files[0].path.as_unix_str(), "later.txt");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_comparison_binary_and_gitlinks(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("binary"), b"before\0").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(
+            path,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                crate::commit::GITLINK_MODE,
+                "1111111111111111111111111111111111111111",
+                "submodule",
+            ],
+        );
+        git_command(path, ["commit", "-m", "initial"]);
+        fs::write(path.join("binary"), b"after\0").unwrap();
+        git_command(path, ["add", "binary"]);
+        git_command(
+            path,
+            [
+                "update-index",
+                "--cacheinfo",
+                crate::commit::GITLINK_MODE,
+                "2222222222222222222222222222222222222222",
+                "submodule",
+            ],
+        );
+        git_command(path, ["commit", "-m", "update"]);
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        for (base, include_base) in [("HEAD~1", false), ("HEAD", true)] {
+            let comparison = repository
+                .load_commit_comparison(base.into(), "HEAD".into(), include_base, cx.to_async())
+                .await
+                .unwrap();
+            assert_eq!(comparison.files.len(), 2);
+            let binary = &comparison.files[0];
+            assert!(binary.is_binary);
+            assert_eq!(binary.status(), CommitFileStatus::Modified);
+            assert_eq!(binary.old_content.as_deref(), Some(b"before\0".as_slice()));
+            assert_eq!(binary.new_content.as_deref(), Some(b"after\0".as_slice()));
+            let gitlink = &comparison.files[1];
+            assert!(!gitlink.is_binary);
+            assert_eq!(gitlink.status(), CommitFileStatus::Modified);
+            assert_eq!(
+                gitlink.old_content.as_deref(),
+                Some(b"Subproject commit 1111111111111111111111111111111111111111\n".as_slice()),
+            );
+            assert_eq!(
+                gitlink.new_content.as_deref(),
+                Some(b"Subproject commit 2222222222222222222222222222222222222222\n".as_slice()),
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_comparison_uses_first_merge_parent(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("root.txt"), "root\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "root"]);
+        git_command(path, ["checkout", "-b", "feature"]);
+        fs::write(path.join("feature.txt"), "feature\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "feature"]);
+        git_command(path, ["checkout", "main"]);
+        fs::write(path.join("main.txt"), "main\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "main"]);
+        git_command(path, ["merge", "--no-ff", "feature", "-m", "merge"]);
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let comparison = repository
+            .load_commit_comparison("HEAD".into(), "HEAD".into(), true, cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(comparison.files.len(), 1);
+        let file = &comparison.files[0];
+        assert_eq!(file.path.as_unix_str(), "feature.txt");
+        assert_eq!(file.status(), CommitFileStatus::Added);
+        assert_eq!(file.new_content.as_deref(), Some(b"feature\n".as_slice()));
+        let error = repository
+            .load_commit_comparison("feature".into(), "main~1".into(), true, cx.to_async())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ancestor"), "{error:#}");
+        let snapshot = repository
+            .load_commit_comparison("feature".into(), "main~1".into(), false, cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.files.len(), 2);
+    }
+
+    #[gpui::test]
     async fn test_load_commit_with_type_changed_file(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
@@ -4919,6 +5314,17 @@ mod tests {
                 ("b.txt".to_string(), None, CommitFileStatus::Added),
             ]
         );
+
+        let error = repository
+            .load_commit_comparison("HEAD".into(), "HEAD".into(), true, cx.to_async())
+            .await
+            .expect_err("missing shallow parent must not be treated as an empty tree");
+        assert!(format!("{error:#}").contains("first parent"), "{error:#}");
+        let snapshot = repository
+            .load_commit_comparison("HEAD".into(), "HEAD".into(), false, cx.to_async())
+            .await
+            .expect("snapshot comparison does not need the missing parent");
+        assert!(snapshot.files.is_empty());
 
         let source_repository = RealGitRepository::new(
             &source_dir.path().join(".git"),

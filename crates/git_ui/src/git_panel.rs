@@ -7362,6 +7362,7 @@ impl GitPanel {
             self.focus_handle.clone(),
             Some(repository.downgrade()),
             self.workspace.clone(),
+            crate::commit_context_menu::GitCommandSelection::single(commit.sha),
             window,
             cx,
         );

@@ -1671,6 +1671,7 @@ mod view_commit_tests {
                 focus_handle,
                 Some(repository.downgrade()),
                 workspace_handle,
+                commit_context_menu::GitCommandSelection::single(selected_commit),
                 window,
                 cx,
             )

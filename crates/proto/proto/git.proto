@@ -301,6 +301,14 @@ message LoadCommitDiff {
   bool ignore_shallow_boundary = 5;
 }
 
+message LoadCommitComparison {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string base_commit = 3;
+  string target_commit = 4;
+  bool include_base_commit = 5;
+}
+
 message LoadCommitDiffResponse {
   repeated CommitFile files = 1;
   bool is_shallow_boundary = 2;

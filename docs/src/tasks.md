@@ -259,18 +259,19 @@ Tasks that define `hooks` are still available from the task modal like any other
 
 The Git Graph supports running custom Git command tasks from the commit context menu.
 To add a command, define a task in your global `tasks.json` file with the `git-command` tag (worktree-local tasks are not supported yet).
-When shown from a commit's context menu, the task is resolved against the selected commit and repository, and runs from the selected repository root by default.
+When shown from a commit's context menu, the task is resolved against the right-clicked commit and repository, and runs from that repository's root by default. The existing SHA and ref variables retain this meaning when multiple commits are selected. Each command still runs once, not once per selected commit.
 Right-clicking a ref label (a branch, remote ref, or tag) opens a ref-specific context menu, where the task is additionally resolved against the clicked ref via `ZED_GIT_REF`.
 
 Git Graph command tasks support the Git-specific task variables below.
 These variables are provided only when resolving Git Graph command tasks.
 Other task variables, such as `ZED_FILE`, `ZED_SELECTED_TEXT`, `ZED_WORKTREE_ROOT`, and `ZED_MAIN_GIT_WORKTREE`, are not provided to Git Graph command tasks unless they use default values.
 
-- `ZED_GIT_SHA`: full SHA of the selected commit.
-- `ZED_GIT_SHA_SHORT`: short SHA of the selected commit.
+- `ZED_GIT_SHA`: full SHA of the right-clicked commit.
+- `ZED_GIT_SHA_SHORT`: short SHA of the right-clicked commit.
 - `ZED_GIT_REPOSITORY_NAME`: name of the selected Git repository.
 - `ZED_GIT_REPOSITORY_PATH`: absolute path to the selected Git repository's working directory.
 - `ZED_GIT_REF`: name of the clicked ref (a branch, remote ref, or tag). Only provided when the menu is opened from a ref label.
+- `ZED_GIT_SELECTION`: JSON describing the selected commits and their comparison semantics; see [Selection-aware commands](#selection-aware-commands).
 
 For example:
 
@@ -286,6 +287,65 @@ For example:
     "label": "Check out $ZED_GIT_REF",
     "command": "git",
     "args": ["checkout", "$ZED_GIT_REF"],
+    "tags": ["git-command"]
+  }
+]
+```
+
+### Selection-aware commands
+
+Git commands can read `ZED_GIT_SELECTION` from their environment to handle a
+selection without splitting or quoting a list of SHAs in shell arguments.
+It is also available as a task variable, for example in a task's `env` field.
+Existing commands do not need to change or declare another tag.
+
+For example, a cumulative selection of two commits produces this shape:
+
+```json
+{
+  "commits": [
+    "1111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222"
+  ],
+  "commit_count": 2,
+  "mode": "cumulative",
+  "base_commit": "1111111111111111111111111111111111111111",
+  "target_commit": "2222222222222222222222222222222222222222",
+  "include_base_commit": true
+}
+```
+
+- `commits` contains the full SHAs of the selected rows, ordered from bottom to
+  top in the graph, independent of click order. It is not a `git rev-list`
+  expansion: a two-commit selection contains only those two commits.
+- `commit_count` is the number of entries in `commits`.
+- `mode` is `single` for one commit, `cumulative` for a Shift-selected range or
+  a commit and its first parent, and `snapshots` for other two-commit selections.
+- `base_commit` and `target_commit` are the first and last SHAs in `commits`.
+  For a single commit, both are that commit.
+- `include_base_commit` is `true` for `single` and `cumulative`, and `false` for
+  `snapshots`. When it is `true`, the diff baseline is the first parent of
+  `base_commit`, or the empty tree if it is a root. `base_commit` itself is the
+  selected endpoint, not the already-resolved parent or empty tree.
+
+Right-clicking inside a selection uses that selection. Right-clicking a commit
+outside it, or opening a menu without a selection, provides a single-commit
+context for the clicked commit. Ref menus, including refs hidden behind a
+`+N` badge, follow the same rule and additionally provide `ZED_GIT_REF`.
+The legacy SHA variables always identify the clicked commit, even when it is
+in the middle of a range.
+
+The JSON describes the selection; it does not validate ancestry or run Git
+operations. A script using cumulative semantics must handle unrelated history,
+root commits, and missing shallow history appropriately.
+
+For a POSIX shell with Python 3 installed, this task prints the selection:
+
+```json [tasks]
+[
+  {
+    "label": "Inspect selected commits",
+    "command": "python3 -c 'import json, os; print(json.dumps(json.loads(os.environ[\"ZED_GIT_SELECTION\"]), indent=2))'",
     "tags": ["git-command"]
   }
 ]

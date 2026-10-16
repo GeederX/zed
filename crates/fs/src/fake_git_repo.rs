@@ -299,6 +299,69 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn load_commit_comparison(
+        &self,
+        base_commit: String,
+        target_commit: String,
+        include_base_commit: bool,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
+        self.with_state_async(false, move |state| {
+            let mut snapshots = state
+                .commit_history
+                .iter()
+                .map(|snapshot| (snapshot.sha.as_str(), &snapshot.head_contents))
+                .collect::<Vec<_>>();
+            if let Some(head) = state.refs.get("HEAD") {
+                snapshots.push((head.as_str(), &state.head_contents));
+            }
+            let resolve = |revision: &str| {
+                let sha = state.refs.get(revision).map_or(revision, String::as_str);
+                snapshots
+                    .iter()
+                    .position(|(candidate, _)| *candidate == sha)
+                    .with_context(|| format!("unknown comparison commit {revision:?}"))
+            };
+            let base_index = resolve(&base_commit)?;
+            let target_index = resolve(&target_commit)?;
+            anyhow::ensure!(
+                !include_base_commit || base_index <= target_index,
+                "Cannot show cumulative changes: base commit must be an ancestor of target commit"
+            );
+            let target = snapshots[target_index].1;
+            let base = if include_base_commit {
+                base_index.checked_sub(1).map(|index| snapshots[index].1)
+            } else {
+                Some(snapshots[base_index].1)
+            };
+            let paths = target
+                .keys()
+                .chain(base.into_iter().flat_map(|contents| contents.keys()))
+                .collect::<HashSet<_>>();
+            let mut files = paths
+                .into_iter()
+                .filter_map(|path| {
+                    let old_content = base.and_then(|contents| contents.get(path));
+                    let new_content = target.get(path);
+                    (old_content != new_content).then(|| git::repository::CommitFile {
+                        path: path.clone(),
+                        is_binary: old_content
+                            .into_iter()
+                            .chain(new_content)
+                            .any(|content| git::repository::is_binary_content(content)),
+                        old_content: old_content.cloned(),
+                        new_content: new_content.cloned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(git::repository::CommitDiff {
+                files,
+                is_shallow_boundary: false,
+            })
+        })
+    }
+
     fn set_index_text(
         &self,
         path: RepoPath,
